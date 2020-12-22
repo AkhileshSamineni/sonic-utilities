@@ -2625,6 +2625,10 @@ def dhcp_relay(ctx):
 @click.option('-link-select', metavar='<link_select>', required=False, type=click.Choice(['enable', 'disable']), help="Enable/Disable link selection option")
 @click.pass_context
 def dhcp_relay_add(ctx, interface_name, ip_addr1, ip_addr2, ip_addr3, ip_addr4, src_intf, link_select):
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    ctx.obj = {}
+    ctx.obj['config_db'] = config_db
     db = ctx.obj["config_db"]
     intf = None
 
@@ -2763,6 +2767,10 @@ def dhcp_relay_add(ctx, interface_name, ip_addr1, ip_addr2, ip_addr3, ip_addr4, 
 @click.argument('ip_addr4', metavar='<ip_addr4>', required=False)
 @click.pass_context
 def dhcp_relay_remove(ctx, interface_name, ip_addr1, ip_addr2, ip_addr3, ip_addr4):
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    ctx.obj = {}
+    ctx.obj['config_db'] = config_db
     db = ctx.obj["config_db"]
     intf = None
 
@@ -2848,6 +2856,10 @@ def dhcp_relay_src_intf(ctx):
 @click.pass_context
 def dhcp_relay_add_src_intf(ctx, interface_name, src_intf):
     """Set DHCP relay source interface"""
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    ctx.obj = {}
+    ctx.obj['config_db'] = config_db
     db = ctx.obj["config_db"]
     intf = None
 
@@ -2891,6 +2903,10 @@ def dhcp_relay_add_src_intf(ctx, interface_name, src_intf):
 @click.pass_context
 def dhcp_relay_remove_src_intf(ctx, interface_name):
     """Remove DHCP relay source interface"""
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    ctx.obj = {}
+    ctx.obj['config_db'] = config_db
     db = ctx.obj["config_db"]
     intf = None
 
@@ -2934,6 +2950,10 @@ def dhcp_relay_link_select(ctx):
 @click.pass_context
 def dhcp_relay_add_link_select(ctx, interface_name):
     """Enable DHCP relay link selection suboption"""
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    ctx.obj = {}
+    ctx.obj['config_db'] = config_db
     db = ctx.obj["config_db"]
     intf = None
 
@@ -2971,6 +2991,10 @@ def dhcp_relay_add_link_select(ctx, interface_name):
 @click.pass_context
 def dhcp_relay_remove_link_select(ctx, interface_name):
     """Disable DHCP relay link selection suboption"""
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    ctx.obj = {}
+    ctx.obj['config_db'] = config_db
     db = ctx.obj["config_db"]
     intf = None
 
