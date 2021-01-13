@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 
+from socket import AF_INET, AF_INET6
 from minigraph import parse_device_desc_xml
 from portconfig import get_child_ports
 from sonic_py_common import device_info, multi_asic
@@ -23,7 +24,6 @@ from utilities_common.intf_filter import parse_interface_in_filter
 import utilities_common.cli as clicommon
 from .utils import log
 
-
 from . import aaa
 from . import chassis_modules
 from . import console
@@ -34,6 +34,7 @@ from . import mlnx
 from . import muxcable
 from . import nat
 from . import vlan
+from . import vxlan
 from .config_mgmt import ConfigMgmtDPB
 
 CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help', '-?'])
@@ -59,6 +60,14 @@ CFG_LOOPBACK_NAME_TOTAL_LEN_MAX = 11
 CFG_LOOPBACK_ID_MAX_VAL = 999
 CFG_LOOPBACK_NO="<0-999>"
 
+CFG_PORTCHANNEL_PREFIX = "PortChannel"
+CFG_PORTCHANNEL_PREFIX_LEN = 11
+CFG_PORTCHANNEL_NAME_TOTAL_LEN_MAX = 15
+CFG_PORTCHANNEL_MAX_VAL = 9999
+CFG_PORTCHANNEL_NO="<0-9999>"
+
+PORT_MTU = "mtu"
+PORT_SPEED = "speed"
 
 asic_type = None
 
@@ -387,6 +396,45 @@ def is_interface_bind_to_vrf(config_db, interface_name):
     entry = config_db.get_entry(table_name, interface_name)
     if entry and entry.get("vrf_name"):
         return True
+    return False
+
+def is_portchannel_name_valid(portchannel_name):
+    """Port channel name validation
+    """
+
+    # Return True if Portchannel name is PortChannelXXXX (XXXX can be 0-9999)
+    if portchannel_name[:CFG_PORTCHANNEL_PREFIX_LEN] != CFG_PORTCHANNEL_PREFIX :
+        return False
+    if (portchannel_name[CFG_PORTCHANNEL_PREFIX_LEN:].isdigit() is False or
+          int(portchannel_name[CFG_PORTCHANNEL_PREFIX_LEN:]) > CFG_PORTCHANNEL_MAX_VAL) :
+        return False
+    if len(portchannel_name) > CFG_PORTCHANNEL_NAME_TOTAL_LEN_MAX:
+        return False
+    return True
+
+def is_portchannel_present_in_db(db, portchannel_name):
+    """Check if Portchannel is present in Config DB
+    """
+
+    # Return True if Portchannel name exists in the CONFIG_DB
+    portchannel_list = db.get_table(CFG_PORTCHANNEL_PREFIX)
+    if portchannel_list is None:
+        return False
+    if portchannel_name in portchannel_list:
+        return True
+    return False
+
+def is_port_member_of_this_portchannel(db, port_name, portchannel_name):
+    """Check if a port is member of given portchannel
+    """
+    portchannel_list = db.get_table(CFG_PORTCHANNEL_PREFIX)
+    if portchannel_list is None:
+        return False
+
+    for k,v in db.get_table('PORTCHANNEL_MEMBER'):
+        if (k == portchannel_name) and (v == port_name):
+            return True
+
     return False
 
 # Return the namespace where an interface belongs
@@ -884,6 +932,7 @@ config.add_command(kube.kubernetes)
 config.add_command(muxcable.muxcable)
 config.add_command(nat.nat)
 config.add_command(vlan.vlan)
+config.add_command(vxlan.vxlan)
 
 @config.command()
 @click.option('-y', '--yes', is_flag=True, callback=_abort_if_false,
@@ -1256,7 +1305,7 @@ def synchronous_mode(sync_mode):
                config reload -y \n
             2. systemctl restart swss
     """
-    
+
     if sync_mode == 'enable' or sync_mode == 'disable':
         config_db = ConfigDBConnector()
         config_db.connect()
@@ -1328,8 +1377,63 @@ def add_portchannel_member(ctx, portchannel_name, port_name):
         ctx.fail("{} is configured as mirror destination port".format(port_name))
 
     # Check if the member interface given by user is valid in the namespace.
-    if interface_name_is_valid(db, port_name) is False:
+    if port_name.startswith("Ethernet") is False or interface_name_is_valid(db, port_name) is False:
         ctx.fail("Interface name is invalid. Please enter a valid interface name!!")
+
+    # Dont proceed if the port channel name is not valid
+    if is_portchannel_name_valid(portchannel_name) is False:
+        ctx.fail("{} is invalid!, name should have prefix '{}' and suffix '{}'"
+                 .format(portchannel_name, CFG_PORTCHANNEL_PREFIX, CFG_PORTCHANNEL_NO))
+
+    # Dont proceed if the port channel does not exist
+    if is_portchannel_present_in_db(db, portchannel_name) is False:
+        ctx.fail("{} is not present.".format(portchannel_name))
+
+    # Dont allow a port to be member of port channel if it is configured with an IP address
+    for key in db.get_table('INTERFACE').keys():
+        if type(key) != tuple:
+            continue
+        if key[0] == port_name:
+            ctx.fail(" {} has ip address {} configured".format(port_name, key[1]))
+            return
+
+    # Dont allow a port to be member of port channel if it is configured as a VLAN member
+    for k,v in db.get_table('VLAN_MEMBER'):
+        if v == port_name:
+            ctx.fail("%s Interface configured as VLAN_MEMBER under vlan : %s" %(port_name,str(k)))
+            return
+
+    # Dont allow a port to be member of port channel if it is already member of a port channel
+    for k,v in db.get_table('PORTCHANNEL_MEMBER'):
+        if v == port_name:
+            ctx.fail("{} Interface is already member of {} ".format(v,k))
+
+    # Dont allow a port to be member of port channel if its speed does not match with existing members
+    for k,v in db.get_table('PORTCHANNEL_MEMBER'):
+        if k == portchannel_name:
+            member_port_entry = db.get_entry('PORT', v)
+            port_entry = db.get_entry('PORT', port_name)
+
+            if member_port_entry is not None and port_entry is not None:
+                member_port_speed = member_port_entry.get(PORT_SPEED)
+
+                port_speed = port_entry.get(PORT_SPEED)
+                if member_port_speed != port_speed:
+                    ctx.fail("Port speed of {} is different than the other members of the portchannel {}"
+                             .format(port_name, portchannel_name))
+
+    # Dont allow a port to be member of port channel if its MTU does not match with portchannel
+    portchannel_entry =  db.get_entry('PORTCHANNEL', portchannel_name)
+    if portchannel_entry and portchannel_entry.get(PORT_MTU) is not None :
+       port_entry = db.get_entry('PORT', port_name)
+
+       if port_entry and port_entry.get(PORT_MTU) is not None:
+            port_mtu = port_entry.get(PORT_MTU)
+
+            portchannel_mtu = portchannel_entry.get(PORT_MTU)
+            if portchannel_mtu != port_mtu:
+                ctx.fail("Port MTU of {} is different than the {} MTU size"
+                         .format(port_name, portchannel_name))
 
     db.set_entry('PORTCHANNEL_MEMBER', (portchannel_name, port_name),
             {'NULL': 'NULL'})
@@ -1340,11 +1444,24 @@ def add_portchannel_member(ctx, portchannel_name, port_name):
 @click.pass_context
 def del_portchannel_member(ctx, portchannel_name, port_name):
     """Remove member from portchannel"""
+    # Dont proceed if the port channel name is not valid
+    if is_portchannel_name_valid(portchannel_name) is False:
+        ctx.fail("{} is invalid!, name should have prefix '{}' and suffix '{}'"
+                 .format(portchannel_name, CFG_PORTCHANNEL_PREFIX, CFG_PORTCHANNEL_NO))
+
     db = ctx.obj['db']
 
     # Check if the member interface given by user is valid in the namespace.
     if interface_name_is_valid(db, port_name) is False:
         ctx.fail("Interface name is invalid. Please enter a valid interface name!!")
+
+    # Dont proceed if the port channel does not exist
+    if is_portchannel_present_in_db(db, portchannel_name) is False:
+        ctx.fail("{} is not present.".format(portchannel_name))
+
+    # Dont proceed if the the port is not an existing member of the port channel
+    if not is_port_member_of_this_portchannel(db, port_name, portchannel_name):
+        ctx.fail("{} is not a member of portchannel {}".format(port_name, portchannel_name))
 
     db.set_entry('PORTCHANNEL_MEMBER', (portchannel_name, port_name), None)
     db.set_entry('PORTCHANNEL_MEMBER', portchannel_name + '|' + port_name, None)
@@ -1814,6 +1931,21 @@ def vrf_add_management_vrf(config_db):
         return None
     config_db.mod_entry('MGMT_VRF_CONFIG', "vrf_global", {"mgmtVrfEnabled": "true"})
     mvrf_restart_services()
+    """
+    The regular expression for grep in below cmd is to match eth0 line in /proc/net/route, sample file:
+    $ cat /proc/net/route
+        Iface   Destination     Gateway         Flags   RefCnt  Use     Metric  Mask            MTU     Window  IRTT
+         eth0    00000000        01803B0A        0003    0       0       202     00000000        0       0       0
+    """
+    cmd = "cat /proc/net/route | grep -E \"eth0\s+00000000\s+[0-9A-Z]+\s+[0-9]+\s+[0-9]+\s+[0-9]+\s+202\" | wc -l"
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    output = proc.communicate()
+    if int(output[0]) >= 1:
+        cmd="ip -4 route del default dev eth0 metric 202"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+        proc.communicate()
+        if proc.returncode != 0:
+            click.echo("Could not delete eth0 route")
 
 def vrf_delete_management_vrf(config_db):
     """Disable management vrf in config DB"""
@@ -1833,6 +1965,8 @@ def snmpagentaddress(ctx):
     config_db.connect()
     ctx.obj = {'db': config_db}
 
+ip_family = {4: AF_INET, 6: AF_INET6}
+
 @snmpagentaddress.command('add')
 @click.argument('agentip', metavar='<SNMP AGENT LISTENING IP Address>', required=True)
 @click.option('-p', '--port', help="SNMP AGENT LISTENING PORT")
@@ -1842,13 +1976,43 @@ def add_snmp_agent_address(ctx, agentip, port, vrf):
     """Add the SNMP agent listening IP:Port%Vrf configuration"""
 
     #Construct SNMP_AGENT_ADDRESS_CONFIG table key in the format ip|<port>|<vrf>
+    if not clicommon.is_ipaddress(agentip):
+        click.echo("Invalid IP address")
+        return False
+    config_db = ctx.obj['db']
+    if not vrf:
+        entry = config_db.get_entry('MGMT_VRF_CONFIG', "vrf_global")
+        if entry and entry['mgmtVrfEnabled'] == 'true' :
+            click.echo("ManagementVRF is Enabled. Provide vrf.")
+            return False
+    found = 0
+    ip = ipaddress.ip_address(agentip)
+    for intf in netifaces.interfaces():
+        ipaddresses = netifaces.ifaddresses(intf)
+        if ip_family[ip.version] in ipaddresses:
+            for ipaddr in ipaddresses[ip_family[ip.version]]:
+                if agentip == ipaddr['addr']:
+                    found = 1
+                    break;
+        if found == 1:
+            break;
+    else:
+        click.echo("IP addfress is not available")
+        return
+
     key = agentip+'|'
     if port:
         key = key+port
+    #snmpd does not start if we have two entries with same ip and port.
+    key1 = "SNMP_AGENT_ADDRESS_CONFIG|" + key + '*'
+    entry = config_db.get_keys(key1)
+    if entry:
+        ip_port = agentip + ":" + port
+        click.echo("entry with {} already exists ".format(ip_port))
+        return
     key = key+'|'
     if vrf:
         key = key+vrf
-    config_db = ctx.obj['db']
     config_db.set_entry('SNMP_AGENT_ADDRESS_CONFIG', key, {})
 
     #Restarting the SNMP service will regenerate snmpd.conf and rerun snmpd
@@ -2303,12 +2467,12 @@ def breakout(ctx, interface_name, mode, verbose, force_remove_dependencies, load
         portJson = dict(); portJson['PORT'] = port_dict
 
         # breakout_Ports will abort operation on failure, So no need to check return
-        breakout_Ports(cm, delPorts=final_delPorts, portJson=portJson, force=force_remove_dependencies, 
+        breakout_Ports(cm, delPorts=final_delPorts, portJson=portJson, force=force_remove_dependencies,
                        loadDefConfig=load_predefined_config, verbose=verbose)
 
         # Set Current Breakout mode in config DB
         brkout_cfg_keys = config_db.get_keys('BREAKOUT_CFG')
-        if interface_name.decode("utf-8") not in  brkout_cfg_keys:
+        if interface_name not in  brkout_cfg_keys:
             click.secho("[ERROR] {} is not present in 'BREAKOUT_CFG' Table!".format(interface_name), fg='red')
             raise click.Abort()
         config_db.set_entry("BREAKOUT_CFG", interface_name, {'brkout_mode': target_brkout_mode})
@@ -2318,6 +2482,7 @@ def breakout(ctx, interface_name, mode, verbose, force_remove_dependencies, load
 
     except Exception as e:
         click.secho("Failed to break out Port. Error: {}".format(str(e)), fg='magenta')
+
         sys.exit(0)
 
 def _get_all_mgmtinterface_keys():
@@ -2359,6 +2524,10 @@ def mtu(ctx, interface_name, interface_mtu, verbose):
         interface_name = interface_alias_to_name(config_db, interface_name)
         if interface_name is None:
             ctx.fail("'interface_name' is None!")
+
+    portchannel_member_table = config_db.get_table('PORTCHANNEL_MEMBER')
+    if interface_is_in_portchannel(portchannel_member_table, interface_name):
+        ctx.fail("'interface_name' is in portchannel!")
 
     if ctx.obj['namespace'] is DEFAULT_NAMESPACE:
         command = "portconfig -p {} -m {}".format(interface_name, interface_mtu)
@@ -3169,6 +3338,56 @@ def del_vrf(ctx, vrf_name):
         del_interface_bind_to_vrf(config_db, vrf_name)
         config_db.set_entry('VRF', vrf_name, None)
 
+
+@vrf.command('add_vrf_vni_map')
+@click.argument('vrfname', metavar='<vrf-name>', required=True, type=str)
+@click.argument('vni', metavar='<vni>', required=True)
+@click.pass_context
+def add_vrf_vni_map(ctx, vrfname, vni):
+    config_db = ctx.obj['config_db']
+    found = 0
+    if vrfname not in config_db.get_table('VRF').keys():
+        ctx.fail("vrf {} doesnt exists".format(vrfname))
+    if not vni.isdigit():
+        ctx.fail("Invalid VNI {}. Only valid VNI is accepted".format(vni))
+
+    if clicommon.vni_id_is_valid(int(vni)) is False:
+        ctx.fail("Invalid VNI {}. Valid range [1 to 16777215].".format(vni))
+
+    vxlan_table = config_db.get_table('VXLAN_TUNNEL_MAP')
+    vxlan_keys = vxlan_table.keys()
+    if vxlan_keys is not None:
+        for key in vxlan_keys:
+            if (vxlan_table[key]['vni'] == vni):
+                found = 1
+                break
+
+    if (found == 0):
+        ctx.fail("VLAN VNI not mapped. Please create VLAN VNI map entry first")
+
+    found = 0
+    vrf_table = config_db.get_table('VRF')
+    vrf_keys = vrf_table.keys()
+    if vrf_keys is not None:
+        for vrf_key in vrf_keys:
+            if ('vni' in vrf_table[vrf_key] and vrf_table[vrf_key]['vni'] == vni):
+                found = 1
+                break
+
+    if (found == 1):
+        ctx.fail("VNI already mapped to vrf {}".format(vrf_key))
+
+    config_db.mod_entry('VRF', vrfname, {"vni": vni})
+
+@vrf.command('del_vrf_vni_map')
+@click.argument('vrfname', metavar='<vrf-name>', required=True, type=str)
+@click.pass_context
+def del_vrf_vni_map(ctx, vrfname):
+    config_db = ctx.obj['config_db']
+    if vrfname not in config_db.get_table('VRF').keys():
+        ctx.fail("vrf {} doesnt exists".format(vrfname))
+
+    config_db.mod_entry('VRF', vrfname, {"vni": 0})
 
 #
 # 'route' group ('config route ...')
